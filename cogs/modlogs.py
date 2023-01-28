@@ -2,41 +2,26 @@ import asyncio
 from typing import Optional, Union
 
 import discord
-from discord.ext.commands import Context, command, guild_only, has_permissions
 
-from utils import (
+from core import (
     Cog,
+    Context,
     GuildModel,
-    ModAction,
-    ModActions,
-    TextChannelID,
+    LogAction,
+    LogActions,
     humanize_time,
 )
 
 
 class ModLogs(Cog):
-    """A cog for moderation action logging."""
-
-    async def mod_log_channel(
-        self, guild: discord.Guild
-    ) -> Optional[discord.TextChannel]:
-        guild_data, _ = await GuildModel.get_or_create(id=guild.id)
-        if guild_data.mod_log:
-            return guild.get_channel(guild_data.mod_log)
-
-    async def server_log_channel(
-        self, guild: discord.Guild
-    ) -> Optional[discord.TextChannel]:
-        guild_data, _ = await GuildModel.get_or_create(id=guild.id)
-        if guild_data.server_log:
-            return guild.get_channel(guild_data.server_log)
+    """Commands related to logs."""
 
     async def mod_log(
         self,
         mod: discord.Member,
         target: discord.User,
         reason: Optional[str],
-        action: ModAction,
+        action: LogAction,
         channel: discord.TextChannel,
     ) -> None:
         await channel.send(
@@ -53,13 +38,13 @@ class ModLogs(Cog):
         mod: discord.Member,
         target: Union[discord.Role, discord.TextChannel],
         reason: Optional[str],
-        action: ModAction,
+        action: LogAction,
         channel: discord.TextChannel,
         after: Optional[Union[discord.Role, discord.TextChannel]] = None,
     ) -> None:
         if isinstance(target, discord.Role):
             # action target is a role
-            if action is ModActions.ROLE_UPDATE:
+            if action is LogActions.ROLE_UPDATE:
                 changes_of_role = []
                 if target.name != after.name:
                     changes_of_role.append(
@@ -89,7 +74,7 @@ class ModLogs(Cog):
                 ).set_author(name=f"{mod} (ID {mod.id})")
             )
         else:
-            if action is ModActions.CHANNEL_UPDATE:
+            if action is LogActions.CHANNEL_UPDATE:
                 changes_of_channel = []
                 if target.name != after.name:
                     changes_of_channel.append(
@@ -123,17 +108,18 @@ class ModLogs(Cog):
                             f"Voice members limit has changed from `{target.user_limit}` to `{after.user_limit}`."
                         )
 
-                await channel.send(
-                    embed=discord.Embed(
-                        description=f"**{action.emoji} {action.text}** {target.mention} *(ID {target.id})*\n:page_facing_up: **Reason:** {reason}",
-                        color=getattr(discord.Color, action.color)(),
+                if changes_of_channel:
+                    await channel.send(
+                        embed=discord.Embed(
+                            description=f"**{action.emoji} {action.text}** {target.mention} *(ID {target.id})*\n:page_facing_up: **Reason:** {reason}",
+                            color=getattr(discord.Color, action.color)(),
+                        )
+                        .add_field(
+                            name="Changes",
+                            value="\n".join(changes_of_channel),
+                        )
+                        .set_author(name=f"{mod} (ID {mod.id})")
                     )
-                    .add_field(
-                        name="Changes",
-                        value="\n".join(changes_of_channel),
-                    )
-                    .set_author(name=f"{mod} (ID {mod.id})")
-                )
                 return
             await channel.send(
                 embed=discord.Embed(
@@ -142,62 +128,87 @@ class ModLogs(Cog):
                 ).set_author(name=f"{mod} (ID {mod.id})")
             )
 
-    @command(name="mod_log")
-    @has_permissions(manage_guild=True)
-    @guild_only()
-    async def _modlog(self, ctx: Context, channel_id: TextChannelID):
-        """Set the channel for moderation logs. Use `0` as channel_id to disable mod logs."""
-        if await GuildModel.update("mod_log", ctx.guild.id, channel_id):
-            return await ctx.send(
-                f"The mod log channel for this server is now <#{channel_id}>."
-            )
-        await ctx.send("Mod logs have been disabled for this server.")
+    logs = discord.SlashCommandGroup(
+        "logs",
+        "Commands related to logs.",
+        guild_only=True,
+        default_member_permissions=discord.Permissions(manage_guild=True),
+    )
 
-    @command(name="server_log")
-    @has_permissions(manage_guild=True)
-    @guild_only()
-    async def _serverlog(self, ctx: Context, channel_id: TextChannelID):
-        """Set the channel for server logs. Use `0` as channel_id to disable server logs."""
-        if await GuildModel.update("server_log", ctx.guild.id, channel_id):
-            return await ctx.send(
-                f"The server log channel for this server is now <#{channel_id}>."
+    @logs.command(name="set")
+    @discord.option(
+        "category",
+        choices=["Moderation", "Server"],
+        description="The category of logs to set a channel for.",
+    )
+    @discord.option(
+        "channel",
+        description="The channel these logs will be sent to.",
+    )
+    async def logs_set(
+        self,
+        ctx: Context,
+        category: str,
+        channel: discord.TextChannel,
+    ):
+        """Set channels for logs."""
+        field = "mod_log" if category == "Moderation" else "server_log"
+        await GuildModel.update_or_create(id=ctx.guild_id, defaults={field: channel.id})
+        await ctx.respond(f"{category} logs will be sent to {channel.mention}.")
+
+    @logs.command(name="disable")
+    @discord.option(
+        "category",
+        choices=["Moderation", "Server"],
+        description="The category of logs to disable.",
+    )
+    async def logs_disable(self, ctx: Context, category: str):
+        field = "mod_log" if category == "Moderation" else "server_log"
+        if (
+            guild := await GuildModel.filter(id=ctx.guild_id)
+            .exclude(**{field: 0})
+            .first()
+        ):
+            await guild.update_from_dict({field: 0}).save()
+            return await ctx.respond(
+                f"{category} logs have been disabled for this server."
             )
-        await ctx.send("Server logs have been disabled for this server.")
+        await ctx.respond(f"{category} logs are already disabled for this server.")
 
     @Cog.listener()
     async def on_member_ban(self, guild: discord.Guild, user):
-        if channel := await self.mod_log_channel(guild):
+        if channel := await GuildModel.get_text_channel(guild, "mod_log"):
             await asyncio.sleep(2)
             async for entry in guild.audit_logs(
                 limit=20, action=discord.AuditLogAction.ban
             ):
                 if entry.target == user:
                     return await self.mod_log(
-                        entry.user, user, entry.reason, ModActions.BAN, channel
+                        entry.user, user, entry.reason, LogActions.BAN, channel
                     )
 
     @Cog.listener()
     async def on_member_unban(self, guild: discord.Guild, user):
-        if channel := await self.mod_log_channel(guild):
+        if channel := await GuildModel.get_text_channel(guild, "mod_log"):
             await asyncio.sleep(2)
             async for entry in guild.audit_logs(
                 limit=20, action=discord.AuditLogAction.unban
             ):
                 if entry.target == user:
                     return await self.mod_log(
-                        entry.user, user, entry.reason, ModActions.UNBAN, channel
+                        entry.user, user, entry.reason, LogActions.UNBAN, channel
                     )
 
     @Cog.listener()
     async def on_member_remove(self, member: discord.Member):
-        if channel := await self.mod_log_channel(member.guild):
+        if channel := await GuildModel.get_text_channel(member.guild, "mod_log"):
             await asyncio.sleep(2)
             async for entry in member.guild.audit_logs(
                 limit=20, action=discord.AuditLogAction.kick
             ):
                 if entry.target == member:
                     return await self.mod_log(
-                        entry.user, member, entry.reason, ModActions.KICK, channel
+                        entry.user, member, entry.reason, LogActions.KICK, channel
                     )
 
     @Cog.listener()
@@ -207,7 +218,7 @@ class ModLogs(Cog):
             or not after.timed_out
         ):
             return
-        if channel := await self.mod_log_channel(after.guild):
+        if channel := await GuildModel.get_text_channel(after.guild, "mod_log"):
             await asyncio.sleep(2)
             async for entry in after.guild.audit_logs(
                 limit=20, action=discord.AuditLogAction.member_update
@@ -221,13 +232,13 @@ class ModLogs(Cog):
                     )
                     reason = f"{entry.reason}\n:hourglass_flowing_sand: **Duration:** {humanize_time(duration)}"
                     return await self.mod_log(
-                        entry.user, after, reason, ModActions.TIMEOUT, channel
+                        entry.user, after, reason, LogActions.TIMEOUT, channel
                     )
 
     # server logs
     @Cog.listener()
     async def on_guild_channel_create(self, channel):
-        if mod_log := await self.server_log_channel(channel.guild):
+        if mod_log := await GuildModel.get_text_channel(channel.guild, "server_log"):
             await asyncio.sleep(2)
             async for entry in channel.guild.audit_logs(
                 limit=20, action=discord.AuditLogAction.channel_create
@@ -237,13 +248,13 @@ class ModLogs(Cog):
                         entry.user,
                         channel,
                         entry.reason,
-                        ModActions.CHANNEL_CREATE,
+                        LogActions.CHANNEL_CREATE,
                         mod_log,
                     )
 
     @Cog.listener()
     async def on_guild_channel_delete(self, channel):
-        if mod_log := await self.server_log_channel(channel.guild):
+        if mod_log := await GuildModel.get_text_channel(channel.guild, "server_log"):
             await asyncio.sleep(2)
             async for entry in channel.guild.audit_logs(
                 limit=20, action=discord.AuditLogAction.channel_delete
@@ -253,13 +264,13 @@ class ModLogs(Cog):
                         entry.user,
                         channel,
                         entry.reason,
-                        ModActions.CHANNEL_DELETE,
+                        LogActions.CHANNEL_DELETE,
                         mod_log,
                     )
 
     @Cog.listener()
     async def on_guild_channel_update(self, before, after):
-        if mod_log := await self.server_log_channel(before.guild):
+        if mod_log := await GuildModel.get_text_channel(after.guild, "server_log"):
             await asyncio.sleep(2)
             async for entry in before.guild.audit_logs(
                 limit=20, action=discord.AuditLogAction.channel_update
@@ -269,38 +280,38 @@ class ModLogs(Cog):
                         entry.user,
                         before,
                         entry.reason,
-                        ModActions.CHANNEL_UPDATE,
+                        LogActions.CHANNEL_UPDATE,
                         mod_log,
                         after,
                     )
 
     @Cog.listener()
     async def on_guild_role_create(self, role):
-        if mod_log := await self.server_log_channel(role.guild):
+        if mod_log := await GuildModel.get_text_channel(role.guild, "server_log"):
             await asyncio.sleep(2)
             async for entry in role.guild.audit_logs(
                 limit=20, action=discord.AuditLogAction.role_create
             ):
                 if entry.target == role:
                     return await self.server_log(
-                        entry.user, role, entry.reason, ModActions.ROLE_CREATE, mod_log
+                        entry.user, role, entry.reason, LogActions.ROLE_CREATE, mod_log
                     )
 
     @Cog.listener()
     async def on_guild_role_delete(self, role):
-        if mod_log := await self.server_log_channel(role.guild):
+        if mod_log := await GuildModel.get_text_channel(role.guild, "server_log"):
             await asyncio.sleep(2)
             async for entry in role.guild.audit_logs(
                 limit=20, action=discord.AuditLogAction.role_delete
             ):
                 if entry.target == role:
                     return await self.server_log(
-                        entry.user, role, entry.reason, ModActions.ROLE_DELETE, mod_log
+                        entry.user, role, entry.reason, LogActions.ROLE_DELETE, mod_log
                     )
 
     @Cog.listener()
     async def on_guild_role_update(self, before, after):
-        if mod_log := await self.server_log_channel(before.guild):
+        if mod_log := await GuildModel.get_text_channel(after.guild, "server_log"):
             await asyncio.sleep(2)
             async for entry in before.guild.audit_logs(
                 limit=20, action=discord.AuditLogAction.role_update
@@ -310,7 +321,7 @@ class ModLogs(Cog):
                         entry.user,
                         before,
                         entry.reason,
-                        ModActions.ROLE_UPDATE,
+                        LogActions.ROLE_UPDATE,
                         mod_log,
                         after,
                     )

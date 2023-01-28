@@ -2,26 +2,25 @@ import re
 from inspect import cleandoc
 
 import discord
-from discord.ext.commands import Context, command, has_permissions
 
-from utils import Cog, pycord_only
+from core import Cog, Context
 
 PASTEBIN_RE = re.compile(r"(https?://pastebin.com)/([a-zA-Z0-9]{8})")
 
 
 async def getattrs(ctx):
-    try:
-        input = ctx.options["thing"]
-        thing = discord
-        path = "discord"
-        for attr in input.split("."):
+    input = ctx.options["thing"]
+    thing = discord
+    path = "discord"
+    for attr in input.split("."):
+        try:
             if attr == "discord":
                 continue
             thing = getattr(thing, attr)
             path += f".{attr}"
-        return [f"{path}.{x}" for x in dir(thing) if not x.startswith("_")][:25]
-    except AttributeError:
-        return [f"{path}.{x}" for x in dir(thing) if x.startswith(attr)][:25]
+            return [f"{path}.{x}" for x in dir(thing) if not x.startswith("_")][:25]
+        except AttributeError:
+            return [f"{path}.{x}" for x in dir(thing) if x.startswith(attr)][:25]
 
 
 class Pycord(Cog):
@@ -58,7 +57,9 @@ class Pycord(Cog):
     async def update_example_cache(self):
         """Updates the cached example list with the latest contents from the repo."""
         file_url = "https://api.github.com/repos/Pycord-Development/pycord/git/trees/master?recursive=1"
-        async with self.bot.http_session.get(file_url, raise_for_status=True) as response:
+        async with self.bot.http_session.get(
+            file_url, raise_for_status=True
+        ) as response:
             self.bot.cache["example_list"] = examples = await response.json()
             return examples
 
@@ -69,11 +70,18 @@ class Pycord(Cog):
         return [
             file["path"].partition("examples/")[2]
             for file in examples["tree"]
-            if "examples" in file["path"] and file["path"].endswith(".py") and ctx.value in file["path"]
+            if "examples" in file["path"]
+            and file["path"].endswith(".py")
+            and ctx.value in file["path"]
         ]
 
     @discord.slash_command(guild_ids=[881207955029110855])
-    async def example(self, ctx, name: discord.Option(str, description="The name of example to search for", autocomplete=get_example_list)):
+    @discord.option(
+        "name",
+        description="The name of example to search for",
+        autocomplete=get_example_list,
+    )
+    async def example(self, ctx, name: str):
         """Get the link of an example from the Pycord repository."""
         if not name.endswith(".py"):
             name = f"{name}.py"
@@ -126,9 +134,43 @@ class Pycord(Cog):
                 ephemeral=True,
             )
 
-    @command()
-    @pycord_only
-    @has_permissions(manage_guild=True)
+    @discord.slash_command(guild_ids=[881207955029110855])
+    async def close(self, ctx: Context, lock: bool = False):
+        """Allows a staff member or the owner of the thread to close the thread"""
+
+        if not isinstance(ctx.channel, discord.Thread):
+            return await ctx.respond(
+                "This command can only be used in threads.", ephemeral=True
+            )
+
+        if ctx.channel.permissions_for(ctx.author).manage_threads:
+            if lock:
+                embed = discord.Embed(
+                    description="This thread was archived and locked by a staff member.",
+                    color=0xFF0000,
+                )
+            else:
+                embed = discord.Embed(
+                    description="This thread was archived by a staff member.",
+                    color=0xFFFF00,
+                )
+            await ctx.respond(embed=embed)
+            await ctx.channel.archive(locked=lock)
+        elif ctx.author.id == ctx.channel.owner_id:
+            embed = discord.Embed(
+                description="This thread was archived by the user that opened it.",
+                color=0xFFFF00,
+            )
+            await ctx.respond(embed=embed)
+            await ctx.channel.archive()
+        else:
+            await ctx.respond(
+                "This command can only be used by the owner of the thread or a staff member.",
+                ephemeral=True,
+            )
+
+    @discord.slash_command(guild_ids=[881207955029110855])
+    @discord.default_permissions(manage_guild=True)
     async def update_staff_list(self, ctx: Context):
         staff_roles = [
             881247351937855549,  # Project Lead
@@ -142,7 +184,7 @@ class Pycord(Cog):
         embed = discord.Embed(title="**Staff List**", color=0x2F3136)
         embed.description = ""
         for role in staff_roles:
-            role = self.bot.pycord.get_role(role)
+            role = ctx.guild.get_role(role)
             embed.description += f"{role.mention} | **{len(role.members)}** \n"
 
             for member in role.members:
@@ -152,14 +194,32 @@ class Pycord(Cog):
         if self.staff_list is not None:
             await self.staff_list.edit(embed=embed)
         else:
-            self.staff_list_channel = self.staff_list_channel or self.bot.get_channel(884730803588829206)
+            self.staff_list_channel = self.staff_list_channel or self.bot.get_channel(
+                884730803588829206
+            )
             await self.staff_list_channel.purge(limit=1)
             self.staff_list = await self.staff_list_channel.send(embed=embed)
-        await ctx.send("Done!")
+        await ctx.respond("Done!")
+
+    @discord.slash_command(guild_ids=[881207955029110855])
+    @discord.option(
+        "role",
+        description="The role that will be added to or removed from you.",
+        choices=[
+            discord.OptionChoice("Events", "915701572003049482"),
+        ],
+    )
+    async def role(self, ctx: Context, role: str):
+        """Choose a role to claim or get rid of."""
+        if int(role) in ctx.author._roles:
+            await ctx.author.remove_roles(discord.Object(role))
+            return await ctx.respond(f"The <@&{role}> role has been removed from you.")
+        await ctx.author.add_roles(discord.Object(role))
+        await ctx.respond(f"You have received the <@&{role}> role.")
 
     @Cog.listener()
     async def on_message(self, message: discord.Message):
-        if message.guild == self.bot.pycord:
+        if message.guild is not None and message.guild.id == 881207955029110855:
             messages = []
             matches = re.findall(PASTEBIN_RE, message.content)
             for match in matches:
